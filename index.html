@@ -33,7 +33,7 @@ body{min-height:100svh;border:clamp(8px,1.2vw,14px) ridge #0800ff;padding:clamp(
 <main id="app">
 <h1 class="brand">GT-GELM MUSIC</h1>
 <div class="tagline">UNA AVENTURA PARA EL QUE TENGA EL VALOR</div>
-<button id="start" type="button">TOCA LA PANTALLA PARA INICIAR</button>
+<button id="start" type="button">▶ PLAY · INICIAR REPRODUCCIÓN</button>
 <div id="current">118 canciones · reproducción aleatoria continua</div>
 <div id="songs" role="listbox" aria-label="Canciones"></div>
 <div id="status">Selecciona una canción o toca para comenzar al azar</div>
@@ -47,7 +47,12 @@ const list=document.getElementById("songs");
 const current=document.getElementById("current");
 const status=document.getElementById("status");
 const start=document.getElementById("start");
-let playingIndex=-1, order=[], orderPos=-1, busy=false, started=false, generation=0;
+let playingIndex=-1, order=[], orderPos=-1, busy=false, started=false, generation=0, retryTimer=null;
+function setPlayState(isPlaying){
+ start.textContent=isPlaying?"Ⅱ PAUSAR · REPRODUCCIÓN ACTIVA":"▶ PLAY · REANUDAR";
+ start.setAttribute("aria-pressed",String(isPlaying));
+ start.dataset.state=isPlaying?"playing":"paused";
+}
 function makeOrder(){
  order=TRACKS.map((_,i)=>i);
  for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]];}
@@ -74,45 +79,107 @@ function mediaInfo(song){
  if(!("mediaSession" in navigator))return;
  try{
   navigator.mediaSession.metadata=new MediaMetadata({title:song.title,artist:"GT-GELM",album:"GT-GELM MUSIC"});
-  navigator.mediaSession.setActionHandler("play",()=>audio.play().catch(()=>{}));
-  navigator.mediaSession.setActionHandler("pause",()=>audio.pause());
-  navigator.mediaSession.setActionHandler("nexttrack",()=>nextTrack());
-  navigator.mediaSession.setActionHandler("previoustrack",()=>previousTrack());
+  navigator.mediaSession.setActionHandler("play",resumePlayback);
+  navigator.mediaSession.setActionHandler("pause",pausePlayback);
+  navigator.mediaSession.setActionHandler("nexttrack",nextTrack);
+  navigator.mediaSession.setActionHandler("previoustrack",previousTrack);
  }catch(e){}
+}
+function waitUntilPlayable(token){
+ return new Promise((resolve,reject)=>{
+  if(audio.readyState>=2){resolve();return;}
+  let settled=false;
+  const finish=(fn,value)=>{if(settled)return;settled=true;clearTimeout(timer);audio.removeEventListener("canplay",onReady);audio.removeEventListener("error",onError);fn(value);};
+  const onReady=()=>finish(resolve);
+  const onError=()=>finish(reject,new Error("Audio source error"));
+  const timer=setTimeout(()=>finish(reject,new Error("Audio load timeout")),12000);
+  audio.addEventListener("canplay",onReady,{once:true});
+  audio.addEventListener("error",onError,{once:true});
+  if(token!==generation)finish(reject,new Error("Playback request superseded"));
+ });
 }
 async function playTrack(i,manual=false){
  if(i<0||i>=TRACKS.length)return;
- const token=++generation;busy=true;playingIndex=i;
- const song=TRACKS[i];audio.pause();audio.src=song.url;audio.load();
- current.textContent=song.title;status.textContent="Conectando…";highlight();mediaInfo(song);
+ const token=++generation;
+ if(retryTimer){clearTimeout(retryTimer);retryTimer=null;}
+ busy=true;playingIndex=i;
+ const song=TRACKS[i];
+ audio.pause();
+ audio.removeAttribute("src");
+ audio.load();
+ audio.src=song.url;
+ audio.load();
+ current.textContent=song.title;
+ status.textContent="Cargando canción…";
+ setPlayState(true);
+ highlight();
+ mediaInfo(song);
  try{
+  await waitUntilPlayable(token);
+  if(token!==generation)return;
   await audio.play();
   if(token!==generation)return;
-  started=true;start.textContent="REPRODUCCIÓN ACTIVADA · TOCA UNA CANCIÓN PARA ELEGIR";
+  started=true;
+  setPlayState(true);
   status.textContent="Reproduciendo · aleatorio continuo";
   if(manual)makeOrder();
  }catch(err){
   if(token!==generation)return;
-  status.textContent="No disponible; intentando la siguiente canción…";
-  setTimeout(()=>{if(token===generation)nextTrack();},900);
- }finally{if(token===generation)busy=false;}
+  setPlayState(false);
+  status.textContent="Esta canción no inició; intentando otra…";
+  retryTimer=setTimeout(()=>{if(token===generation)nextTrack();},1200);
+ }finally{
+  if(token===generation)busy=false;
+ }
 }
 function nextTrack(){
  if(!order.length||orderPos>=order.length-1)makeOrder();
- orderPos++;playTrack(order[orderPos],false);
+ orderPos++;
+ playTrack(order[orderPos],false);
 }
 function previousTrack(){
  if(!order.length||orderPos<=0){playTrack((playingIndex-1+TRACKS.length)%TRACKS.length,true);return;}
- orderPos--;playTrack(order[orderPos],false);
+ orderPos--;
+ playTrack(order[orderPos],false);
+}
+function resumePlayback(){
+ if(playingIndex<0){makeOrder();nextTrack();return;}
+ audio.play().then(()=>{
+  started=true;setPlayState(true);status.textContent="Reproduciendo · aleatorio continuo";
+ }).catch(()=>{
+  setPlayState(false);status.textContent="Toca PLAY para reanudar la música";
+ });
+}
+function pausePlayback(){
+ audio.pause();setPlayState(false);status.textContent="En pausa";
 }
 start.addEventListener("click",()=>{
- if(!started){makeOrder();nextTrack();}
- else if(audio.paused)audio.play().then(()=>status.textContent="Reproduciendo · aleatorio continuo").catch(()=>status.textContent="Toca una canción para reanudar");
+ if(!started&&playingIndex<0){makeOrder();nextTrack();return;}
+ if(audio.paused)resumePlayback();else pausePlayback();
 });
-audio.addEventListener("ended",()=>nextTrack());
-audio.addEventListener("error",()=>{if(!busy){status.textContent="Audio no disponible; pasando a otra canción…";setTimeout(nextTrack,700);}});
-audio.addEventListener("playing",()=>status.textContent="Reproduciendo · aleatorio continuo");
+audio.addEventListener("ended",()=>{
+ // Keep playback active: queue the next track and explicitly start it.
+ setPlayState(true);
+ status.textContent="Preparando la siguiente canción…";
+ nextTrack();
+});
+audio.addEventListener("error",()=>{
+ if(!busy&&playingIndex>=0){
+  setPlayState(false);
+  status.textContent="Audio no disponible; pasando a otra canción…";
+  if(retryTimer)clearTimeout(retryTimer);
+  retryTimer=setTimeout(nextTrack,900);
+ }
+});
+audio.addEventListener("playing",()=>{
+ setPlayState(true);
+ status.textContent="Reproduciendo · aleatorio continuo";
+});
+audio.addEventListener("pause",()=>{
+ if(!audio.ended&&started)setPlayState(false);
+});
 audio.addEventListener("waiting",()=>status.textContent="Cargando audio…");
+
 render();
 if("serviceWorker" in navigator && location.protocol.startsWith("http")){
  window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(()=>{}));
